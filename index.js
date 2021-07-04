@@ -107,7 +107,7 @@ async function removeFeed(chatId, uuid, name) {
     let isFeedInUse = false
     for(const recipient of Object.values(data.recipients))
         for(const feed of recipient.feeds)
-            if(feed.uuid === uuuid)
+            if(feed.uuid === uuid)
                 isFeedInUse = true
 
     if(!isFeedInUse) delete data.feeds[uuid]
