@@ -19,6 +19,7 @@ model recipient {
   chatId          Int
   feedId          Int
   title           String            @db.VarChar(250)
+  filters         String            @default("[]") @db.Text
   feed            feed              @relation(fields: [feedId], references: [id])
   receivedMessage ReceivedMessage[] @relation("receivedMessageToRecipient")
 

@@ -64,7 +64,7 @@ async function emitToRecipients(item, feed) {
 					recipientId: recipient.id,
 					guid: item.guid,
 				},
-			})) == null
+			})) == null && matchesFilter(recipient, item)
 
         if(canSend) {
             await sendToRecipient(recipient.chatId, recipient.title, item)
@@ -78,6 +78,26 @@ async function emitToRecipients(item, feed) {
     await prisma.receivedMessage.createMany({
         data: insertPayload
     })
+}
+
+function matchesFilter(recipient, item) {
+	const filters = JSON.parse(recipient.filters)
+
+	if(filters.length === 0) return true
+
+	const title = (item.title || "").toLowerCase()
+	const description = striptags(item.summary || item.description || item.content || "").toLowerCase()
+	const link = (item.link || "").toLowerCase()
+
+	for(const _filter of filters) {
+		const filter = _filter.toLowerCase()
+
+		if(title.indexOf(filter) !== -1) return true
+		if(description.indexOf(filter) !== -1) return true
+		if(link.indexOf(filter) !== -1) return true
+	}
+
+	return false
 }
 
 async function sendToRecipient(chatId, customTitle, item) {
@@ -101,7 +121,7 @@ async function parseFeedUrl(url) {
 	return await parser.parseURL(url)
 }
 
-async function addFeed(chatId, url, feed, customName = null) {
+async function addFeed(chatId, url, feed, customName = null, filters = []) {
 	const name = customName ? customName : feed.title
 
     let feedEntry = await prisma.feed.findFirst({
@@ -125,7 +145,8 @@ async function addFeed(chatId, url, feed, customName = null) {
 		data: {
 			chatId: chatId,
 			feedId: feedEntry.id,
-			title: name
+			title: name,
+			filters: JSON.stringify(filters)
 		},
 	})
 
@@ -343,7 +364,13 @@ bot.onText(/\/feeds/, async (message) => {
 	const items = []
 
 	for (const feed of feeds) {
-		items.push(`*${feed.title}*`)
+		let name = `*${feed.title}*`
+		const filters = JSON.parse(feed.filters)
+
+		if(filters.length > 0)
+			name += ` - Gefiltert mit ${ filters.join(', ') }`
+
+		items.push(name)
 	}
 
 	bot.sendMessage(
@@ -543,11 +570,39 @@ bot.on("message", async (message) => {
 					switch (message.text) {
 						case "Namen beibehalten":
 							{
-								await addFeed(
+								// await addFeed(
+								// 	chatId,
+								// 	currentActions[chatId].feed.url,
+								// 	currentActions[chatId].feed.data
+								// )
+
+								bot.sendMessage(
 									chatId,
-									currentActions[chatId].feed.url,
-									currentActions[chatId].feed.data
+									`Möchtest du die Ergebnisse filtern?`,
+									{
+										parse_mode: "Markdown",
+										reply_markup: {
+											keyboard: [
+												[
+													{
+														text: "Ja",
+													},
+													{
+														text: "Nein",
+													},
+												],
+												[
+													{
+														text: "Abbrechen",
+													},
+												],
+											],
+											one_time_keyboard: true,
+										},
+									}
 								)
+								
+								currentActions[chatId].section = "requestFilters"
 							}
 							break
 						case "Namen ändern": {
@@ -578,19 +633,89 @@ bot.on("message", async (message) => {
 						chatId,
 						'Ungültige Eingabe. Bitte sende mir einen Namen. Wenn du den Namen nicht ändern willst, so sende mir "Namen beibehalten" oder gib /cancel zum abbrechen ein.'
 					)
-				else if (message.text === "Namen beibehalten")
-					await addFeed(
+				else {
+					if(message.text !== "Namen beibehalten")
+						currentActions[chatId].feed.title = message.text
+
+					bot.sendMessage(
 						chatId,
-						currentActions[chatId].feed.url,
-						currentActions[chatId].feed.data
+						`Möchtest du die Ergebnisse filtern?`,
+						{
+							parse_mode: "Markdown",
+							reply_markup: {
+								keyboard: [
+									[
+										{
+											text: "Ja",
+										},
+										{
+											text: "Nein",
+										},
+									],
+									[
+										{
+											text: "Abbrechen",
+										},
+									],
+								],
+								one_time_keyboard: true,
+							},
+						}
 					)
-				else
+								
+					currentActions[chatId].section = "requestFilters"
+				}
+			} break
+			case "requestFilters": {
+				switch (message.text) {
+					case "Ja":
+						{
+							bot.sendMessage(chatId, `Sende mir alle zu filternde Begriffe getrennt mit Komma. Wenn du keine Filter einstellen willst, so sende mir ein Minus (-)\n\n(Beispiel: Wetter, Klima, Regen, Sonne, Hitze)`)
+							currentActions[chatId].section = "filters"
+						}
+						break
+					case "Nein":
+						{
+							await addFeed(
+								chatId,
+								currentActions[chatId].feed.url,
+								currentActions[chatId].feed.data,
+								currentActions[chatId].feed.title
+							)
+						}
+						break
+					case "Abbrechen":
+						break
+					default: {
+						bot.sendMessage(
+							chatId,
+							'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel'
+						)
+					}
+				}
+			} break
+			case "filters": {
+				if(message.text === "-")
 					await addFeed(
 						chatId,
 						currentActions[chatId].feed.url,
 						currentActions[chatId].feed.data,
-						message.text
+						currentActions[chatId].feed.title
 					)
+				else {
+					const filters = []
+
+					for(const filter of message.text.split(','))
+						filters.push(filter.trim())
+
+					await addFeed(
+						chatId,
+						currentActions[chatId].feed.url,
+						currentActions[chatId].feed.data,
+						currentActions[chatId].feed.title,
+						filters
+					)
+				}
 			}
 		}
 	} else if (
