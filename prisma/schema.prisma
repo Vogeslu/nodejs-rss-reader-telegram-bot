@@ -1,0 +1,36 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model feed {
+  id        Int         @id @default(autoincrement())
+  url       String      @unique @db.VarChar(1000)
+  title     String      @db.VarChar(250)
+  recipient recipient[]
+}
+
+model recipient {
+  id              Int               @id @default(autoincrement())
+  chatId          Int
+  feedId          Int
+  title           String            @db.VarChar(250)
+  feed            feed              @relation(fields: [feedId], references: [id])
+  receivedMessage ReceivedMessage[] @relation("receivedMessageToRecipient")
+
+  @@index([feedId], name: "feedId")
+}
+
+model ReceivedMessage {
+  id          Int       @id @default(autoincrement())
+  recipientId Int
+  guid        String    @db.VarChar(1000)
+  recipient   recipient @relation("receivedMessageToRecipient", fields: [recipientId], references: [id])
+
+  @@index([recipientId], name: "recipientId")
+  @@map("received_message")
+}

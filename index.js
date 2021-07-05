@@ -1,227 +1,252 @@
-const config = require('./config')
+const config = require("./config")
 
-const TelegramBot = require('node-telegram-bot-api')
+const TelegramBot = require("node-telegram-bot-api")
 const bot = new TelegramBot(config.botToken, { polling: true })
 
-const Parser = require('rss-parser')
+const Parser = require("rss-parser")
 const parser = new Parser()
 
-const fs = require('fs')
-const util = require('util')
+const RssFeedEmitter = require("rss-feed-emitter")
+const feeder = new RssFeedEmitter({ skipFirstLoad: true })
 
-const striptags = require('striptags')
+const striptags = require("striptags")
 
-const uuidv4 = require('uuid').v4
+const uuidv4 = require("uuid").v4
 
-const readFile = util.promisify(fs.readFile)
-const writeFile = util.promisify(fs.writeFile)
-
+const PrismaClient = require("@prisma/client").PrismaClient
+const prisma = new PrismaClient()
 
 let currentActions = {}
 
-let data = {
-    feeds: {},
-    recipients: {}
+initializeFeedListener()
+
+async function initializeFeedListener() {
+	const feeds = await prisma.feed.findMany()
+
+	for (const feed of feeds) startFeedListener(feed)
 }
 
-async function initialize() {
-    try {
-        data = JSON.parse(await readFile('data.json', 'utf8'))
-    } catch(e) {
-        await writeFile('data.json', JSON.stringify(data), 'utf8')
-    }
+async function startFeedListener(feed) {
+    console.log(`Added feed ${ feed.title }`)
 
+	const uuid = uuidv4()
 
-    await checkForUpdates()
+	feeder.add({
+		url: feed.url,
+		eventName: uuid,
+	})
 
-    setInterval(async () => await writeFile('data.json', JSON.stringify(data), 'utf8'), 30 * 1000)
-    setInterval(async () => await checkForUpdates(), 10 * 1000)
+	feeder.on(uuid, (item) => emitToRecipients(item, feed))
 }
 
-async function checkForUpdates() {
-    const now = Date.now()
-    for(const [uuid, feed] of Object.entries(data.feeds)) {
-        if(feed.lastUpdated === null || (feed.lastUpdated + (60 * 1000)) < now) {
-            try {
-                await getFeedDataAndEmit(uuid)
-                feed.lastUpdated = now
-            } catch(e) {}
+async function stopFeedListener(feed) {
+    console.log(`Removed feed ${ feed.title }`)
+	feeder.remove(feed.url)
+}
+
+async function emitToRecipients(item, feed) {
+    console.log(`Received message from feed ${ feed.title } with guid ${ item.guid }`)
+
+	const recipients = await prisma.recipient.findMany({
+		where: {
+			feed: {
+				id: feed.id,
+			},
+		},
+	})
+
+    const insertPayload = []
+
+	for (const recipient of recipients) {
+		const canSend =
+			(await prisma.receivedMessage.findFirst({
+				where: {
+					recipientId: recipient.id,
+					guid: item.guid,
+				},
+			})) == null
+
+        if(canSend) {
+            await sendToRecipient(recipient.chatId, recipient.title, item)
+            insertPayload.push({
+                recipientId: recipient.id,
+                guid: item.guid 
+            })
         }
-    }
+	}
+
+    await prisma.receivedMessage.createMany({
+        data: insertPayload
+    })
 }
 
-initialize()
+async function sendToRecipient(chatId, customTitle, item) {
+
+	const title = item.title || "Ohne Titel"
+	const description = striptags(
+		item.summary || item.description || item.content || "Ohne Beschreibung"
+	)
+	const link = item.link || "Ohne Link"
+
+	bot.sendMessage(
+		chatId,
+		`*${title}*\n\n${description}\n\n${link} (${customTitle})`,
+		{
+			parse_mode: "Markdown",
+		}
+	)
+}
 
 async function parseFeedUrl(url) {
 	return await parser.parseURL(url)
 }
 
 async function addFeed(chatId, url, feed, customName = null) {
-    const name = customName ? customName : feed.title
+	const name = customName ? customName : feed.title
 
-    const recipientData = data.recipients[chatId] || { feeds: [] }
-
-    let existingFeedUUID = searchForExistingFeed(url)
-    if(!existingFeedUUID) {
-        existingFeedUUID = uuidv4()
-
-        data.feeds[existingFeedUUID] = {
-            url: url,
-            title: feed.title,
-            lastUpdated: null
+    let feedEntry = await prisma.feed.findFirst({
+        where: {
+            url: url
         }
+    })
+
+    if(!feedEntry) {
+        feedEntry = await prisma.feed.create({
+            data: {
+                url: url,
+                title: feed.title
+            }
+        })
+
+        startFeedListener(feedEntry)
     }
 
-    recipientData.feeds.push({
-        uuid: existingFeedUUID,
-        title: name,
-        lastMessage: null,
-        fromSetup: true
-    })
+	await prisma.recipient.create({
+		data: {
+			chatId: chatId,
+			feedId: feedEntry.id,
+			title: name
+		},
+	})
 
-    data.recipients[chatId] = recipientData
+	bot.sendMessage(
+		chatId,
+		`Ich habe *${name}* hinzugefügt. Ab jetzt wirst du über neue Nachrichten automatisch benachrichtigt. Die Daten werden alle 60 Sekunden abgeglichen.`,
+		{
+			parse_mode: "Markdown",
+		}
+	)
 
-    await writeFile('data.json', JSON.stringify(data), 'utf8')
-
-    bot.sendMessage(chatId, `Ich habe *${ name }* hinzugefügt. Ab jetzt wirst du über neue Nachrichten automatisch benachrichtigt. Die Daten werden alle 60 Sekunden abgeglichen.`, {
-        parse_mode: 'Markdown'
-    })
-
-    delete currentActions[chatId]
+	delete currentActions[chatId]
 }
 
-async function removeFeed(chatId, uuid, name) {
-    const recipientData = data.recipients[chatId] || { feeds: [] }
+async function removeFeedFromDatabase(id) {
+	const feed = await prisma.feed.findUnique({
+		where: {
+			id: id,
+		},
+	})
 
-    let index = -1
+	stopFeedListener(feed)
 
-    for(let i in recipientData.feeds)
-        if(recipientData.feeds[i].uuid === uuid)
-            index = i
+	await prisma.feed.delete({
+		where: {
+			id: id,
+		},
+	})
+}
 
-    if(index !== -1)
-        recipientData.feeds.splice(index, 1)
+async function removeFeed(chatId, id, name) {
+	const recipient = await prisma.recipient.findFirst({
+		where: {
+			chatId: chatId,
+			feed: {
+				id: id,
+			},
+		},
+	})
 
-    data.recipients[chatId] = recipientData
-
-    let isFeedInUse = false
-    for(const recipient of Object.values(data.recipients))
-        for(const feed of recipient.feeds)
-            if(feed.uuid === uuid)
-                isFeedInUse = true
-
-    if(!isFeedInUse) delete data.feeds[uuid]
-
-    await writeFile('data.json', JSON.stringify(data), 'utf8')
-
-    bot.sendMessage(chatId, `Ich habe *${ name }* entfernt.`, {
-        parse_mode: 'Markdown'
+    await prisma.receivedMessage.deleteMany({
+        where: {
+            recipientId: recipient.id
+        }
     })
 
-    delete currentActions[chatId]
+	await prisma.recipient.delete({
+		where: {
+			id: recipient.id,
+		},
+	})
+
+	const isFeedInUse =
+		(await prisma.recipient.findFirst({
+			where: {
+				feed: {
+					id: id,
+				},
+			},
+		})) != null
+
+	if (!isFeedInUse) removeFeedFromDatabase(id)
+
+	bot.sendMessage(chatId, `Ich habe *${name}* entfernt.`, {
+		parse_mode: "Markdown",
+	})
+
+	delete currentActions[chatId]
 }
 
 async function removeAllFeeds(chatId) {
-    const recipientData = data.recipients[chatId] || { feeds: [] }
+	const recipientFeeds = await prisma.recipient.findMany({
+		where: {
+			chatId: chatId,
+		},
+	})
 
-    for(const recipientFeed of recipientData.feeds) {
-        const uuid = recipientFeed.uuid
-
-        let isFeedInUse = false
-
-        for(const [_chatId, recipient] of Object.entries(data.recipients)) {
-            if(`${_chatId}` !== `${chatId}`)
-                for(const feed of recipient.feeds)
-                    if(feed.uuid === uuid)
-                        isFeedInUse = true
-        }
-
-        if(!isFeedInUse) delete data.feeds[uuid]
-    }
-
-    data.recipients[chatId].feeds = []
-
-    await writeFile('data.json', JSON.stringify(data), 'utf8')
-
-    bot.sendMessage(chatId, `Ich habe alle Feeds entfernt.`, {
-        parse_mode: 'Markdown'
-    })
-
-    delete currentActions[chatId]
-}
-
-function searchForExistingFeed(url) {
-    let existingFeed = null
-
-    for(const [uuid, feed] of Object.entries(data.feeds))
-        if(feed.url === url)
-            existingFeed = uuid
-    
-    return existingFeed
-}
-
-function isSubscribedToFeed(chatId, url) {
-    const existingFeedUUID = searchForExistingFeed(url)
-    if(!existingFeedUUID) return false
-
-    const recipientData = data.recipients[chatId] || { feeds: [] }
-
-    for(const feed of recipientData.feeds)
-        if(feed.uuid === existingFeedUUID) return true
-
-    return false
-}
-
-async function getFeedDataAndEmit(uuid) {
-    const feed = data.feeds[uuid];
-
-    try {
-        console.log(`Parsing ${ feed.url }`)
-        const feedData = await parseFeedUrl(feed.url)
-
-        for(const [chatId, recipient] of Object.entries(data.recipients))
-            for(const _feed of recipient.feeds)
-                if(_feed.uuid === uuid)
-                    emitStackToRecipient(feedData, recipient, chatId, _feed)
-    } catch(e) {
-
-    }
-}
-
-async function emitStackToRecipient(feed, recipient, chatId, recipientFeed) {
-    if(recipientFeed.fromSetup) {
-        recipientFeed.fromSetup = false
-        recipientFeed.lastMessage = Date.now()
-    } else {
-        let relevantMessages = []
-        let newestMessage = recipient.lastMessage
-
-        for(const item of feed.items) {
-            const pubDate = Date.parse(item.pubDate)
-
-            if(pubDate > recipientFeed.lastMessage) {
-                relevantMessages.push(item)
-
-                if(pubDate > newestMessage)
-                    newestMessage = pubDate
+    for(const recipientFeed of recipientFeeds)
+        await prisma.receivedMessage.deleteMany({
+            where: {
+                recipientId: recipientFeed.id
             }
-        }
+        })
 
-        for(const item of relevantMessages)
-            sendToRecipient(chatId, recipientFeed, item)
+	await prisma.recipient.deleteMany({
+		where: {
+			chatId: chatId,
+		},
+	})
 
-        recipientFeed.lastMessage = newestMessage
-    }
+	for (const recipientFeed of recipientFeeds) {
+		const isFeedInUse =
+			(await prisma.recipient.findFirst({
+				where: {
+					feed: {
+						id: recipientFeed.feedId,
+					},
+				},
+			})) != null
+
+		if (!isFeedInUse) removeFeedFromDatabase(recipientFeed.feedId)
+	}
+
+	bot.sendMessage(chatId, `Ich habe alle Feeds entfernt.`, {
+		parse_mode: "Markdown",
+	})
+
+	delete currentActions[chatId]
 }
 
-function sendToRecipient(chatId, recipientFeed, item) {
-    const title = item.title || 'Ohne Titel'
-    const description = striptags(item.description || item.content || 'Ohne Beschreibung')
-    const link = item.link || 'Ohne Link'
+async function isSubscribedToFeed(chatId, url) {
+	const result = await prisma.recipient.findFirst({
+		where: {
+			chatId: chatId,
+			feed: {
+				url: url,
+			},
+		},
+	})
 
-    bot.sendMessage(chatId, `*${ title }*\n\n${ description }\n\n${ link } (${ recipientFeed.title })`, {
-        parse_mode: 'Markdown'
-    })
+	return result != null
 }
 
 bot.onText(/\/start/, (message) => {
@@ -234,132 +259,154 @@ bot.onText(/\/start/, (message) => {
 bot.onText(/\/addfeed/, (message) => {
 	const chatId = message.chat.id
 
-	if (currentActions[chatId] && currentActions[chatId].type === 'addfeed')
+	if (currentActions[chatId] && currentActions[chatId].type === "addfeed")
 		return bot.sendMessage(
 			chatId,
-			'Du bist bereits dabei einen neuen Feed hinzuzufügen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist bereits dabei einen neuen Feed hinzuzufügen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 	else if (currentActions[chatId])
 		return bot.sendMessage(
 			chatId,
-			'Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 
 	currentActions[chatId] = {
-        type: 'addfeed',
-        section: 'url'
-    }
+		type: "addfeed",
+		section: "url",
+	}
 
-    bot.sendMessage(chatId, 'Alles klar. Sende mir nun die URL des RSS Feeds.')
+	bot.sendMessage(chatId, "Alles klar. Sende mir nun die URL des RSS Feeds.")
 })
 
-bot.onText(/\/remfeed/, (message) => {
+bot.onText(/\/remfeed/, async (message) => {
 	const chatId = message.chat.id
 
-	if (currentActions[chatId] && currentActions[chatId].type === 'addfeed')
+	if (currentActions[chatId] && currentActions[chatId].type === "addfeed")
 		return bot.sendMessage(
 			chatId,
-			'Du bist bereits dabei einen Feed zu entfernen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist bereits dabei einen Feed zu entfernen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 	else if (currentActions[chatId])
 		return bot.sendMessage(
 			chatId,
-			'Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 
-    currentActions[chatId] = {
-        type: 'remfeed',
-        section: 'type'
-    }
+	currentActions[chatId] = {
+		type: "remfeed",
+		section: "type",
+	}
 
-    const recipientData = data.recipients[chatId] || { feeds: [] }
+	const feeds = await prisma.recipient.findMany({
+		where: {
+			chatId: chatId,
+		},
+	})
 
-    if(recipientData.feeds.length === 0)
-        return bot.sendMessage(chatId, 'Du hast noch keine Feeds abonniert.')
+	if (feeds.length === 0)
+		return bot.sendMessage(chatId, "Du hast noch keine Feeds abonniert.")
 
-    const items = []
+	const items = []
 
-    for(const feed of recipientData.feeds)
-        items.push([{ text: feed.title }])
+	for (const feed of feeds) items.push([{ text: feed.title }])
 
-    bot.sendMessage(chatId, 'Bitte wähle einen Feed aus, den du entfernen möchtest...', {
-        reply_markup: {
-            keyboard: items,
-            one_time_keyboard: true
-        }
-    })
+	bot.sendMessage(
+		chatId,
+		"Bitte wähle einen Feed aus, den du entfernen möchtest...",
+		{
+			reply_markup: {
+				keyboard: items,
+				one_time_keyboard: true,
+			},
+		}
+	)
 })
 
-bot.onText(/\/feeds/, (message) => {
+bot.onText(/\/feeds/, async (message) => {
 	const chatId = message.chat.id
 
-    if (currentActions[chatId])
+	if (currentActions[chatId])
 		return bot.sendMessage(
 			chatId,
-			'Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 
-    const recipientData = data.recipients[chatId] || { feeds: [] }
+	const feeds = await prisma.recipient.findMany({
+		where: {
+			chatId: chatId,
+		},
+	})
 
-    if(recipientData.feeds.length === 0)
-        return bot.sendMessage(chatId, 'Du hast noch keine Feeds abonniert.')
+	if (feeds.length === 0)
+		return bot.sendMessage(chatId, "Du hast noch keine Feeds abonniert.")
 
-    const items = []
+	const items = []
 
-    for(const feed of recipientData.feeds) {
-        const feedData = data.feeds[feed.uuid]
-        items.push(`*${ feed.title }*`)
-    }
+	for (const feed of feeds) {
+		items.push(`*${feed.title}*`)
+	}
 
-    bot.sendMessage(chatId, `Du hast folgende Feeds abonniert:\n\n${ items.join('\n') }`, {
-        parse_mode: 'Markdown'
-    })
+	bot.sendMessage(
+		chatId,
+		`Du hast folgende Feeds abonniert:\n\n${items.join("\n")}`,
+		{
+			parse_mode: "Markdown",
+		}
+	)
 })
 
-bot.onText(/\/stop/, (message) => {
+bot.onText(/\/stop/, async (message) => {
 	const chatId = message.chat.id
 
-	if (currentActions[chatId] && currentActions[chatId].type === 'addfeed')
+	if (currentActions[chatId] && currentActions[chatId].type === "addfeed")
 		return bot.sendMessage(
 			chatId,
-			'Du bist bereits dabei alle Feeds zu entfernen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist bereits dabei alle Feeds zu entfernen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 	else if (currentActions[chatId])
 		return bot.sendMessage(
 			chatId,
-			'Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+			"Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein."
 		)
 
-    currentActions[chatId] = {
-        type: 'stop',
-        section: 'confirm'
-    }
+	const feeds = await prisma.recipient.findMany({
+		where: {
+			chatId: chatId,
+		},
+	})
 
-    const recipientData = data.recipients[chatId] || { feeds: [] }
+	currentActions[chatId] = {
+		type: "stop",
+		section: "confirm",
+	}
 
-    if(recipientData.feeds.length === 0)
-        return bot.sendMessage(chatId, 'Du hast noch keine Feeds abonniert.')
+	if (feeds.length === 0)
+		return bot.sendMessage(chatId, "Du hast noch keine Feeds abonniert.")
 
-    bot.sendMessage(chatId, `Du bist dabei ${ recipientData.feeds.length } Feeds zu löschen. Möhtest du fortfahren?`, {
-        reply_markup: {
-            keyboard: [
-                [
-                    {
-                        text: 'Ja'
-                    },
-                    {
-                        text: 'Nein'
-                    }
-                ],
-                [
-                    {
-                        text: 'Abbrechen'
-                    }
-                ]
-            ],
-            one_time_keyboard: true
-        }
-    })
+	bot.sendMessage(
+		chatId,
+		`Du bist dabei ${feeds.length} Feeds zu löschen. Möhtest du fortfahren?`,
+		{
+			reply_markup: {
+				keyboard: [
+					[
+						{
+							text: "Ja",
+						},
+						{
+							text: "Nein",
+						},
+					],
+					[
+						{
+							text: "Abbrechen",
+						},
+					],
+				],
+				one_time_keyboard: true,
+			},
+		}
+	)
 })
 
 bot.onText(/(\/cancel)|Abbrechen/, (message) => {
@@ -367,195 +414,297 @@ bot.onText(/(\/cancel)|Abbrechen/, (message) => {
 
 	if (currentActions[chatId]) {
 		delete currentActions[chatId]
-		bot.sendMessage(chatId, 'Aktueller Prozess wurde abgebrochen.')
-	} else bot.sendMessage(chatId, 'Es gibt nichts zum Abbrechen.')
+		bot.sendMessage(chatId, "Aktueller Prozess wurde abgebrochen.")
+	} else bot.sendMessage(chatId, "Es gibt nichts zum Abbrechen.")
 })
 
-
-bot.on('message', async (message) => {
+bot.on("message", async (message) => {
 	const chatId = message.chat.id
 
-    if(message.text && message.text.indexOf('/cancel') === 0) return
+	if (message.text && message.text.indexOf("/cancel") === 0) return
 
-    if(currentActions[chatId] && currentActions[chatId].type === 'addfeed') {
+	if (currentActions[chatId] && currentActions[chatId].type === "addfeed") {
+		switch (currentActions[chatId].section) {
+			case "url":
+				{
+					if (await isSubscribedToFeed(chatId, message.text))
+						return bot.sendMessage(
+							chatId,
+							"Du hast diesen Feed bereits abonniert. Gib eine andere URL ein oder breche mit /cancel ab."
+						)
 
-        switch(currentActions[chatId].section) {
-            case 'url': {
-                if(isSubscribedToFeed(chatId, message.text))
-                    return bot.sendMessage(chatId, 'Du hast diesen Feed bereits abonniert. Gib eine andere URL ein oder breche mit /cancel ab.')
+					bot.sendMessage(
+						chatId,
+						"Ich prüfe nun die URL, warte einen Moment..."
+					)
 
-                bot.sendMessage(chatId, 'Ich prüfe nun die URL, warte einen Moment...')
+					try {
+						const feed = await parseFeedUrl(message.text)
 
-                try {
-                    const feed = await parseFeedUrl(message.text)
-                    
-                    bot.sendMessage(chatId, `Ich habe einen Feed names *${feed.title || 'Unbekannter Name'}* (${ feed.link || '' }) gefunden.\n\nMöchtest Du diesen Feed hinzufügen?`, {
-                        parse_mode: 'Markdown',
-                        reply_markup: {
-                            keyboard: [
-                                [
-                                    {
-                                        text: 'Ja'
-                                    },
-                                    {
-                                        text: 'Nein'
-                                    }
-                                ],
-                                [
-                                    {
-                                        text: 'Abbrechen'
-                                    }
-                                ]
-                            ],
-                            one_time_keyboard: true
-                        }
-                    })
+						bot.sendMessage(
+							chatId,
+							`Ich habe einen Feed names *${
+								feed.title || "Unbekannter Name"
+							}* (${
+								feed.link || ""
+							}) gefunden.\n\nMöchtest Du diesen Feed hinzufügen?`,
+							{
+								parse_mode: "Markdown",
+								reply_markup: {
+									keyboard: [
+										[
+											{
+												text: "Ja",
+											},
+											{
+												text: "Nein",
+											},
+										],
+										[
+											{
+												text: "Abbrechen",
+											},
+										],
+									],
+									one_time_keyboard: true,
+								},
+							}
+						)
 
-                    currentActions[chatId].section = 'add'
-                    currentActions[chatId].feed = {
-                        url: message.text,
-                        data: feed
-                    }
-                } catch(e) {
-                    bot.sendMessage(chatId, 'Das scheint eine ungültige URL zu sein. Bitte versuche es nochmal oder gib /cancel zum Abbrechen ein.')
-                }
-            } break
-            case 'add': {
-                switch(message.text) {
-                    case 'Ja': {
-                        bot.sendMessage(chatId, `Möchtest du den Namen *${ currentActions[chatId].feed.data.title }* beibehalten oder ändern?`, {
-                            parse_mode: 'Markdown',
-                            reply_markup: {
-                                keyboard: [
-                                    [
-                                        {
-                                            text: 'Namen beibehalten'
-                                        },
-                                        {
-                                            text: 'Namen ändern'
-                                        }
-                                    ],
-                                    [
-                                        {
-                                            text: 'Abbrechen'
-                                        }
-                                    ]
-                                ],
-                                one_time_keyboard: true
-                            }
-                        })
+						currentActions[chatId].section = "add"
+						currentActions[chatId].feed = {
+							url: message.text,
+							data: feed,
+						}
+					} catch (e) {
+						bot.sendMessage(
+							chatId,
+							"Das scheint eine ungültige URL zu sein. Bitte versuche es nochmal oder gib /cancel zum Abbrechen ein."
+						)
+					}
+				}
+				break
+			case "add":
+				{
+					switch (message.text) {
+						case "Ja":
+							{
+								bot.sendMessage(
+									chatId,
+									`Möchtest du den Namen *${currentActions[chatId].feed.data.title}* beibehalten oder ändern?`,
+									{
+										parse_mode: "Markdown",
+										reply_markup: {
+											keyboard: [
+												[
+													{
+														text: "Namen beibehalten",
+													},
+													{
+														text: "Namen ändern",
+													},
+												],
+												[
+													{
+														text: "Abbrechen",
+													},
+												],
+											],
+											one_time_keyboard: true,
+										},
+									}
+								)
 
-                        currentActions[chatId].section = 'name'
-                    } break
-                    case 'Nein': {
-                        bot.sendMessage(chatId, 'In Ordnung. Sende mir eine neue URL oder gib /cancel zum Abbrechen ein.')
-                        currentActions[chatId].section = 'url'
-                    } break
-                    case 'Abbrechen': break
-                    default: {
-                        bot.sendMessage(chatId, 'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel')
-                    }
-                }
-            } break
-            case 'name': {
-                switch(message.text) {
-                    case 'Namen beibehalten': {
-                        await addFeed(chatId, currentActions[chatId].feed.url, currentActions[chatId].feed.data)
-                    } break
-                    case 'Namen ändern': {
-                        bot.sendMessage(chatId, `Bitte sende mir einen anderen Namen für *${ currentActions[chatId].feed.data.title }*`, {
-                            parse_mode: 'Markdown'
-                        })
+								currentActions[chatId].section = "name"
+							}
+							break
+						case "Nein":
+							{
+								bot.sendMessage(
+									chatId,
+									"In Ordnung. Sende mir eine neue URL oder gib /cancel zum Abbrechen ein."
+								)
+								currentActions[chatId].section = "url"
+							}
+							break
+						case "Abbrechen":
+							break
+						default: {
+							bot.sendMessage(
+								chatId,
+								'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel'
+							)
+						}
+					}
+				}
+				break
+			case "name":
+				{
+					switch (message.text) {
+						case "Namen beibehalten":
+							{
+								await addFeed(
+									chatId,
+									currentActions[chatId].feed.url,
+									currentActions[chatId].feed.data
+								)
+							}
+							break
+						case "Namen ändern": {
+							bot.sendMessage(
+								chatId,
+								`Bitte sende mir einen anderen Namen für *${currentActions[chatId].feed.data.title}*`,
+								{
+									parse_mode: "Markdown",
+								}
+							)
 
-                        currentActions[chatId].section = 'customName'
-                    }
-                    case 'Abbrechen': break
-                    default: {
-                        bot.sendMessage(chatId, 'Ungültige Eingabe. Erlaubt sind "Namen beibehalten", "Namen ändern", "Abbrechen" und /cancel')
-                    }
-                }
-            } break
-            case 'customName': {
-                if(message.text <= 0)
-                    bot.sendMessage(chatId, 'Ungültige Eingabe. Bitte sende mir einen Namen. Wenn du den Namen nicht ändern willst, so sende mir "Namen beibehalten" oder gib /cancel zum abbrechen ein.')
-                else if(message.text === 'Namen beibehalten')
-                await addFeed(chatId, currentActions[chatId].feed.url, currentActions[chatId].feed.data)
-                else
-                    await addFeed(chatId, currentActions[chatId].feed.url, currentActions[chatId].feed.data, message.text)
-            }
-        }
-    } else if(currentActions[chatId] && currentActions[chatId].type === 'remfeed') {
-        switch(currentActions[chatId].section) {
-            case 'type': {
-                let target = null
+							currentActions[chatId].section = "customName"
+						}
+						case "Abbrechen":
+							break
+						default: {
+							bot.sendMessage(
+								chatId,
+								'Ungültige Eingabe. Erlaubt sind "Namen beibehalten", "Namen ändern", "Abbrechen" und /cancel'
+							)
+						}
+					}
+				}
+				break
+			case "customName": {
+				if (message.text <= 0)
+					bot.sendMessage(
+						chatId,
+						'Ungültige Eingabe. Bitte sende mir einen Namen. Wenn du den Namen nicht ändern willst, so sende mir "Namen beibehalten" oder gib /cancel zum abbrechen ein.'
+					)
+				else if (message.text === "Namen beibehalten")
+					await addFeed(
+						chatId,
+						currentActions[chatId].feed.url,
+						currentActions[chatId].feed.data
+					)
+				else
+					await addFeed(
+						chatId,
+						currentActions[chatId].feed.url,
+						currentActions[chatId].feed.data,
+						message.text
+					)
+			}
+		}
+	} else if (
+		currentActions[chatId] &&
+		currentActions[chatId].type === "remfeed"
+	) {
+		switch (currentActions[chatId].section) {
+			case "type":
+				{
+					const feed = await prisma.recipient.findFirst({
+						where: {
+							chatId: chatId,
+							title: message.text,
+						},
+					})
 
-                const recipientData = data.recipients[chatId] || { feeds: [] }
+					if (!feed)
+						return bot.sendMessage(
+							chatId,
+							"Ungültiger Feed. Bitte gib einen vorhandenen Feed an oder breche mit /cancel ab."
+						)
 
-                for(const feed of recipientData.feeds)
-                    if(feed.title === message.text)
-                        target = feed
+					bot.sendMessage(
+						chatId,
+						`Möchtest du den Feed names *${feed.title}* wirklich löschen?`,
+						{
+							parse_mode: "Markdown",
+							reply_markup: {
+								keyboard: [
+									[
+										{
+											text: "Ja",
+										},
+										{
+											text: "Nein",
+										},
+									],
+									[
+										{
+											text: "Abbrechen",
+										},
+									],
+								],
+								one_time_keyboard: true,
+							},
+						}
+					)
 
-                if(!target)
-                    return bot.sendMessage(chatId, 'Ungültiger Feed. Bitte gib einen vorhandenen Feed an oder breche mit /cancel ab.')
-
-                    bot.sendMessage(chatId, `Möchtest du den Feed names *${target.title}* wirklich löschen?`, {
-                        parse_mode: 'Markdown',
-                        reply_markup: {
-                            keyboard: [
-                                [
-                                    {
-                                        text: 'Ja'
-                                    },
-                                    {
-                                        text: 'Nein'
-                                    }
-                                ],
-                                [
-                                    {
-                                        text: 'Abbrechen'
-                                    }
-                                ]
-                            ],
-                            one_time_keyboard: true
-                        }
-                    })
-
-                    currentActions[chatId].section = 'confirm'
-                    currentActions[chatId].feed = target
-            } break
-            case 'confirm': {
-                switch(message.text) {
-                    case 'Ja': {
-                        await removeFeed(chatId, currentActions[chatId].feed.uuid, currentActions[chatId].feed.title)
-                    } break
-                    case 'Nein': {
-                        bot.sendMessage(chatId, 'In Ordnung. Ich habe den Vorgang abgebrochen.')
-                        delete currentActions[chatId]
-                    } break
-                    case 'Abbrechen': break
-                    default: {
-                        bot.sendMessage(chatId, 'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel')
-                    }
-                }
-            }
-        }
-    } else if(currentActions[chatId] && currentActions[chatId].type === 'stop') {
-        switch(currentActions[chatId].section) {
-            case 'confirm': {
-                switch(message.text) {
-                    case 'Ja': {
-                        await removeAllFeeds(chatId)
-                    } break
-                    case 'Nein': {
-                        bot.sendMessage(chatId, 'In Ordnung. Ich habe den Vorgang abgebrochen.')
-                        delete currentActions[chatId]
-                    } break
-                    case 'Abbrechen': break
-                    default: {
-                        bot.sendMessage(chatId, 'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel')
-                    }
-                }
-            }
-        }
-    }
+					currentActions[chatId].section = "confirm"
+					currentActions[chatId].feed = feed
+				}
+				break
+			case "confirm": {
+				switch (message.text) {
+					case "Ja":
+						{
+							await removeFeed(
+								chatId,
+								currentActions[chatId].feed.id,
+								currentActions[chatId].feed.title
+							)
+						}
+						break
+					case "Nein":
+						{
+							bot.sendMessage(
+								chatId,
+								"In Ordnung. Ich habe den Vorgang abgebrochen."
+							)
+							delete currentActions[chatId]
+						}
+						break
+					case "Abbrechen":
+						break
+					default: {
+						bot.sendMessage(
+							chatId,
+							'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel'
+						)
+					}
+				}
+			}
+		}
+	} else if (
+		currentActions[chatId] &&
+		currentActions[chatId].type === "stop"
+	) {
+		switch (currentActions[chatId].section) {
+			case "confirm": {
+				switch (message.text) {
+					case "Ja":
+						{
+							await removeAllFeeds(chatId)
+						}
+						break
+					case "Nein":
+						{
+							bot.sendMessage(
+								chatId,
+								"In Ordnung. Ich habe den Vorgang abgebrochen."
+							)
+							delete currentActions[chatId]
+						}
+						break
+					case "Abbrechen":
+						break
+					default: {
+						bot.sendMessage(
+							chatId,
+							'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel'
+						)
+					}
+				}
+			}
+		}
+	}
 })
