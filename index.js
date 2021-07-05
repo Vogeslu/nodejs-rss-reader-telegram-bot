@@ -118,7 +118,9 @@ async function sendToRecipient(chatId, customTitle, item) {
 }
 
 async function parseFeedUrl(url) {
-	return await parser.parseURL(url)
+	const result = await parser.parseURL(url)
+	if(!result.title) result.title = url
+	return result
 }
 
 async function addFeed(chatId, url, feed, customName = null, filters = []) {
