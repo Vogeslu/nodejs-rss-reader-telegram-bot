@@ -121,6 +121,35 @@ async function removeFeed(chatId, uuid, name) {
     delete currentActions[chatId]
 }
 
+async function removeAllFeeds(chatId) {
+    const recipientData = data.recipients[chatId] || { feeds: [] }
+
+    for(const recipientFeed of recipientData.feeds) {
+        const uuid = recipientFeed.uuid
+
+        let isFeedInUse = false
+
+        for(const [_chatId, recipient] of Object.entries(data.recipients)) {
+            if(`${_chatId}` !== `${chatId}`)
+                for(const feed of recipient.feeds)
+                    if(feed.uuid === uuid)
+                        isFeedInUse = true
+        }
+
+        if(!isFeedInUse) delete data.feeds[uuid]
+    }
+
+    data.recipients[chatId].feeds = []
+
+    await writeFile('data.json', JSON.stringify(data), 'utf8')
+
+    bot.sendMessage(chatId, `Ich habe alle Feeds entfernt.`, {
+        parse_mode: 'Markdown'
+    })
+
+    delete currentActions[chatId]
+}
+
 function searchForExistingFeed(url) {
     let existingFeed = null
 
@@ -165,18 +194,23 @@ async function emitStackToRecipient(feed, recipient, chatId, recipientFeed) {
         recipientFeed.lastMessage = Date.now()
     } else {
         let relevantMessages = []
+        let newestMessage = recipient.lastMessage
 
         for(const item of feed.items) {
             const pubDate = Date.parse(item.pubDate)
 
-            if(pubDate > recipientFeed.lastMessage)
+            if(pubDate > recipientFeed.lastMessage) {
                 relevantMessages.push(item)
+
+                if(pubDate > newestMessage)
+                    newestMessage = pubDate
+            }
         }
 
         for(const item of relevantMessages)
             sendToRecipient(chatId, recipientFeed, item)
 
-        recipientFeed.lastMessage = Date.now()
+        recipientFeed.lastMessage = newestMessage
     }
 }
 
@@ -279,6 +313,52 @@ bot.onText(/\/feeds/, (message) => {
 
     bot.sendMessage(chatId, `Du hast folgende Feeds abonniert:\n\n${ items.join('\n') }`, {
         parse_mode: 'Markdown'
+    })
+})
+
+bot.onText(/\/stop/, (message) => {
+	const chatId = message.chat.id
+
+	if (currentActions[chatId] && currentActions[chatId].type === 'addfeed')
+		return bot.sendMessage(
+			chatId,
+			'Du bist bereits dabei alle Feeds zu entfernen. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+		)
+	else if (currentActions[chatId])
+		return bot.sendMessage(
+			chatId,
+			'Du bist aktuell noch in einem anderen Prozess. Wenn du den aktuellen Prozess abbrechen möchtest, so gib /cancel ein.'
+		)
+
+    currentActions[chatId] = {
+        type: 'stop',
+        section: 'confirm'
+    }
+
+    const recipientData = data.recipients[chatId] || { feeds: [] }
+
+    if(recipientData.feeds.length === 0)
+        return bot.sendMessage(chatId, 'Du hast noch keine Feeds abonniert.')
+
+    bot.sendMessage(chatId, `Du bist dabei ${ recipientData.feeds.length } Feeds zu löschen. Möhtest du fortfahren?`, {
+        reply_markup: {
+            keyboard: [
+                [
+                    {
+                        text: 'Ja'
+                    },
+                    {
+                        text: 'Nein'
+                    }
+                ],
+                [
+                    {
+                        text: 'Abbrechen'
+                    }
+                ]
+            ],
+            one_time_keyboard: true
+        }
     })
 })
 
@@ -447,6 +527,24 @@ bot.on('message', async (message) => {
                 switch(message.text) {
                     case 'Ja': {
                         await removeFeed(chatId, currentActions[chatId].feed.uuid, currentActions[chatId].feed.title)
+                    } break
+                    case 'Nein': {
+                        bot.sendMessage(chatId, 'In Ordnung. Ich habe den Vorgang abgebrochen.')
+                        delete currentActions[chatId]
+                    } break
+                    case 'Abbrechen': break
+                    default: {
+                        bot.sendMessage(chatId, 'Ungültige Eingabe. Erlaubt sind "Ja", "Nein", "Abbrechen" und /cancel')
+                    }
+                }
+            }
+        }
+    } else if(currentActions[chatId] && currentActions[chatId].type === 'stop') {
+        switch(currentActions[chatId].section) {
+            case 'confirm': {
+                switch(message.text) {
+                    case 'Ja': {
+                        await removeAllFeeds(chatId)
                     } break
                     case 'Nein': {
                         bot.sendMessage(chatId, 'In Ordnung. Ich habe den Vorgang abgebrochen.')
