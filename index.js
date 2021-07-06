@@ -21,6 +21,8 @@ let currentActions = {}
 initializeFeedListener()
 
 async function initializeFeedListener() {
+	feeder.on('error', console.error);
+
 	const feeds = await prisma.feed.findMany()
 
 	for (const feed of feeds) startFeedListener(feed)
